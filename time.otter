@@ -1,0 +1,272 @@
+use memory;
+
+// ── Windows FFI ──
+link "kernel32.dll" ~> GetSystemTimeAsFileTime(lpFileTime:rawptr) -> void;
+link "kernel32.dll" ~> GetTickCount64() -> int;
+link "kernel32.dll" ~> QueryPerformanceCounter(lpCounter:rawptr) -> bool;
+link "kernel32.dll" ~> QueryPerformanceFrequency(lpFreq:rawptr) -> bool;
+link "kernel32.dll" ~> Sleep(dwMilliseconds:int) -> void;
+
+// ── Linux syscalls ──
+link 228 ~> __linux_clock_gettime(clk_id:int, tp:rawptr) -> int;
+link 35  ~> __linux_nanosleep(req:rawptr, rem:rawptr) -> int;
+
+// ── macOS syscalls (0x2000000 + number) ──
+link 33554660 ~> __macos_clock_gettime(clk_id:int, tp:rawptr) -> int;
+link 33554467 ~> __macos_nanosleep(req:rawptr, rem:rawptr) -> int;
+
+
+/**
+ * Returns the current time as a Unix epoch timestamp (seconds since 1970-01-01T00:00:00Z).
+ * On Windows, converts the FILETIME 100-nanosecond intervals since 1601 to Unix epoch.
+ * On Linux/macOS, uses clock_gettime with CLOCK_REALTIME (0).
+ * @returns  Seconds since Unix epoch
+ */
+~> now() -> int {
+  match (PLATFORM) {
+    1 -> {
+      // Windows: FILETIME is 100ns intervals since 1601-01-01
+      // Unix epoch offset: 116444736000000000 (in 100ns units)
+      rock ft:rawptr = memory.alloc(8);
+      GetSystemTimeAsFileTime(ft);
+      rock raw:int = *ft;
+      memory.free(ft);
+      // Convert 100ns -> seconds, subtract epoch offset
+      rock epoch_offset:int = 116444736000000000;
+      rock adjusted:int = raw - epoch_offset;
+      return adjusted / 10000000;
+    };
+    0 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __linux_clock_gettime(0, ts);
+      rock secs:int = *ts;
+      memory.free(ts);
+      return secs;
+    };
+    2 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __macos_clock_gettime(0, ts);
+      rock secs:int = *ts;
+      memory.free(ts);
+      return secs;
+    };
+    _ -> { return 0; };
+  }
+}
+
+
+/**
+ * Returns the current time in milliseconds since Unix epoch.
+ * Higher precision than now().
+ * @returns  Milliseconds since Unix epoch
+ */
+~> now_ms() -> int {
+  match (PLATFORM) {
+    1 -> {
+      rock ft:rawptr = memory.alloc(8);
+      GetSystemTimeAsFileTime(ft);
+      rock raw:int = *ft;
+      memory.free(ft);
+      rock epoch_offset:int = 116444736000000000;
+      rock adjusted:int = raw - epoch_offset;
+      return adjusted / 10000;
+    };
+    0 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __linux_clock_gettime(0, ts);
+      rock secs:int = *ts;
+      rock nanos_ptr:rawptr = ts @ 8;
+      rock nanos:int = *nanos_ptr;
+      memory.free(ts);
+      return secs * 1000 + nanos / 1000000;
+    };
+    2 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __macos_clock_gettime(0, ts);
+      rock secs:int = *ts;
+      rock nanos_ptr:rawptr = ts @ 8;
+      rock nanos:int = *nanos_ptr;
+      memory.free(ts);
+      return secs * 1000 + nanos / 1000000;
+    };
+    _ -> { return 0; };
+  }
+}
+
+
+/**
+ * Returns a monotonic timestamp in milliseconds for measuring elapsed time.
+ * Unlike now(), this clock is not affected by system time changes.
+ * On Windows, uses GetTickCount64. On Linux/macOS, uses CLOCK_MONOTONIC (1).
+ * @returns  Monotonic milliseconds
+ */
+~> monotonic_ms() -> int {
+  match (PLATFORM) {
+    1 -> {
+      return GetTickCount64();
+    };
+    0 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __linux_clock_gettime(1, ts);
+      rock secs:int = *ts;
+      rock nanos_ptr:rawptr = ts @ 8;
+      rock nanos:int = *nanos_ptr;
+      memory.free(ts);
+      return secs * 1000 + nanos / 1000000;
+    };
+    2 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __macos_clock_gettime(1, ts);
+      rock secs:int = *ts;
+      rock nanos_ptr:rawptr = ts @ 8;
+      rock nanos:int = *nanos_ptr;
+      memory.free(ts);
+      return secs * 1000 + nanos / 1000000;
+    };
+    _ -> { return 0; };
+  }
+}
+
+
+/**
+ * Returns a high-resolution monotonic timestamp in nanoseconds.
+ * Best for micro-benchmarking and profiling.
+ * @returns  Monotonic nanoseconds
+ */
+~> monotonic_ns() -> int {
+  match (PLATFORM) {
+    1 -> {
+      rock counter:rawptr = memory.alloc(8);
+      rock freq:rawptr = memory.alloc(8);
+      QueryPerformanceCounter(counter);
+      QueryPerformanceFrequency(freq);
+      rock c:int = *counter;
+      rock f:int = *freq;
+      memory.free(counter);
+      memory.free(freq);
+      // Convert: (counter * 1_000_000_000) / freq
+      // To avoid overflow: (counter / freq) * 1e9 + ((counter % freq) * 1e9) / freq
+      rock whole:int = c / f;
+      rock frac:int = c - whole * f;
+      return whole * 1000000000 + frac * 1000000000 / f;
+    };
+    0 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __linux_clock_gettime(1, ts);
+      rock secs:int = *ts;
+      rock nanos_ptr:rawptr = ts @ 8;
+      rock nanos:int = *nanos_ptr;
+      memory.free(ts);
+      return secs * 1000000000 + nanos;
+    };
+    2 -> {
+      rock ts:rawptr = memory.alloc(16);
+      __macos_clock_gettime(1, ts);
+      rock secs:int = *ts;
+      rock nanos_ptr:rawptr = ts @ 8;
+      rock nanos:int = *nanos_ptr;
+      memory.free(ts);
+      return secs * 1000000000 + nanos;
+    };
+    _ -> { return 0; };
+  }
+}
+
+
+/**
+ * Suspends the current thread for the specified duration.
+ * @param ms  Duration in milliseconds
+ */
+~> sleep(ms:int) -> void {
+  match (PLATFORM) {
+    1 -> {
+      Sleep(ms);
+    };
+    0 -> {
+      rock timespec:rawptr = memory.alloc(16);
+      rock seconds:int = ms / 1000;
+      rock nanos:int = (ms - seconds * 1000) * 1000000;
+      *timespec = seconds;
+      rock nanos_ptr:rawptr = timespec @ 8;
+      *nanos_ptr = nanos;
+      __linux_nanosleep(timespec, null);
+      memory.free(timespec);
+    };
+    2 -> {
+      rock timespec:rawptr = memory.alloc(16);
+      rock seconds:int = ms / 1000;
+      rock nanos:int = (ms - seconds * 1000) * 1000000;
+      *timespec = seconds;
+      rock nanos_ptr:rawptr = timespec @ 8;
+      *nanos_ptr = nanos;
+      __macos_nanosleep(timespec, null);
+      memory.free(timespec);
+    };
+    _ -> {};
+  }
+}
+
+
+/**
+ * Measures the elapsed time in milliseconds since a given start timestamp.
+ * Use with monotonic_ms() for accurate interval measurement:
+ *   rock start:int = time.monotonic_ms();
+ *   // ... work ...
+ *   rock elapsed:int = time.elapsed_ms(start);
+ * @param start_ms  Start timestamp from monotonic_ms()
+ * @returns         Elapsed milliseconds
+ */
+~> elapsed_ms(start_ms:int) -> int {
+  rock now_val:int = monotonic_ms();
+  return now_val - start_ms;
+}
+
+
+/**
+ * Extracts the hour (0-23) from a Unix epoch timestamp.
+ * Assumes UTC timezone.
+ * @param epoch  Seconds since Unix epoch
+ * @returns      Hour of day (0-23)
+ */
+~> hour(epoch:int) -> int {
+  rock day_secs:int = epoch - (epoch / 86400) * 86400;
+  return day_secs / 3600;
+}
+
+
+/**
+ * Extracts the minute (0-59) from a Unix epoch timestamp.
+ * @param epoch  Seconds since Unix epoch
+ * @returns      Minute within the hour (0-59)
+ */
+~> minute(epoch:int) -> int {
+  rock day_secs:int = epoch - (epoch / 86400) * 86400;
+  rock hour_secs:int = day_secs - (day_secs / 3600) * 3600;
+  return hour_secs / 60;
+}
+
+
+/**
+ * Extracts the second (0-59) from a Unix epoch timestamp.
+ * @param epoch  Seconds since Unix epoch
+ * @returns      Second within the minute (0-59)
+ */
+~> second(epoch:int) -> int {
+  rock day_secs:int = epoch - (epoch / 86400) * 86400;
+  rock hour_secs:int = day_secs - (day_secs / 3600) * 3600;
+  return hour_secs - (hour_secs / 60) * 60;
+}
+
+
+/**
+ * Returns the day of the week (0=Thursday, 1=Friday, ..., 6=Wednesday)
+ * for a Unix epoch timestamp. Day 0 of Unix epoch (1970-01-01) is Thursday.
+ * For conventional Monday=0 numbering, use: (time.weekday(epoch) + 3) % 7
+ * @param epoch  Seconds since Unix epoch
+ * @returns      Day index from epoch day 0
+ */
+~> weekday(epoch:int) -> int {
+  rock days:int = epoch / 86400;
+  rock wd:int = (days + 4) - ((days + 4) / 7) * 7;
+  return wd;
+}
