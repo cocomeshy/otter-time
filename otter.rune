@@ -1,0 +1,6 @@
+rune 1
+name "time"
+version "1.0.0"
+description "Standard library time package"
+author "cocomeshy"
+license "MIT"
